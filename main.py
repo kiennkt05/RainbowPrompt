@@ -46,7 +46,7 @@ def initialize_experiment(seed=None):
     if seed == 0:
         seed = random.randint(1, 100000)
     set_seed(seed)
-    # save_seed(seed)
+    save_seed(seed)
 
 def main(args):
     
