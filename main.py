@@ -46,7 +46,7 @@ def initialize_experiment(seed=None):
     if seed == 0:
         seed = random.randint(1, 100000)
     set_seed(seed)
-    save_seed(seed)
+    # save_seed(seed)
 
 def main(args):
     
@@ -68,7 +68,7 @@ def main(args):
     cudnn.benchmark = True
 
     data_loader, class_mask = build_continual_dataloader(args)
-    logger.info(f'Class Mask: {class_mask}')
+    # logger.info(f'Class Mask: {class_mask}')
 
     print(f"Creating original model: {args.model}")
     original_model = create_model(

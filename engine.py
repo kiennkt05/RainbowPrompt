@@ -82,11 +82,10 @@ def train_one_epoch(model: torch.nn.Module, original_model: torch.nn.Module,
         metric_logger.update(Lr=optimizer.param_groups[0]["lr"])
         metric_logger.meters['Acc@1'].update(acc1.item(), n=input.shape[0])
         metric_logger.meters['Acc@5'].update(acc5.item(), n=input.shape[0])
-        logger.info(metric_logger)
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
-    logger.info("Averaged stats:", metric_logger)
+    logger.info(f"Averaged stats: {metric_logger}")
 
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
@@ -97,14 +96,13 @@ def evaluate(model: torch.nn.Module, original_model: torch.nn.Module, data_loade
     criterion = torch.nn.CrossEntropyLoss()
 
     metric_logger = utils.MetricLogger(delimiter="  ")
-    header = 'Test: [Task {}]'.format(task_id + 1)
     logger.info('Test: [Task {}]'.format(task_id + 1))
 
     model.eval()
     original_model.eval()
 
     with torch.no_grad():
-        for input, target in metric_logger.log_every(data_loader, args.print_freq, header):
+        for input, target in metric_logger.log_every(data_loader, args.print_freq):
             input = input.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
 
@@ -132,7 +130,6 @@ def evaluate(model: torch.nn.Module, original_model: torch.nn.Module, data_loade
             metric_logger.meters['Loss'].update(loss.item())
             metric_logger.meters['Acc@1'].update(acc1.item(), n=input.shape[0])
             metric_logger.meters['Acc@5'].update(acc5.item(), n=input.shape[0])
-            logger.info(metric_logger)
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     logger.info('* Acc@1 {top1.global_avg:.3f} Acc@5 {top5.global_avg:.3f} loss {losses.global_avg:.3f}'
@@ -168,12 +165,20 @@ def evaluate_till_now(model: torch.nn.Module, original_model: torch.nn.Module, d
     diagonal = np.diag(acc_matrix)
 
     result_str = "[Average accuracy till task{}]\tAcc@1: {:.4f}\tAcc@5: {:.4f}\tLoss: {:.4f}".format(task_id+1, avg_stat[0], avg_stat[1], avg_stat[2])
+    # Append Acc@1 to /output_dir/acc.txt
+    with open(os.path.join(args.output_dir, 'acc.txt'), 'a') as f:
+        f.write(f"{avg_stat[0]}\n")
+
     if task_id > 0:
         forgetting = np.mean((np.max(acc_matrix, axis=1) -
                             acc_matrix[:, task_id])[:task_id])
         backward = np.mean((acc_matrix[:, task_id] - diagonal)[:task_id])
 
         result_str += "\tForgetting: {:.4f}\tBackward: {:.4f}".format(forgetting, backward)
+        # Append Forgetting to /output_dir/forgetting.txt
+        with open(os.path.join(args.output_dir, 'forgetting.txt'), 'a') as f:
+            f.write(f"{forgetting}\n")
+    
     logger.info(result_str)
 
     return test_stats
