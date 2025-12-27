@@ -114,7 +114,8 @@ def main(args):
         warm_up=args.warm_up,
         KI_iter=args.KI_iter,
         self_attn_idx = args.self_attn_idx,
-        D2=args.D2
+        D2=args.D2,
+        args=args
     )
     original_model.to(device)
     model.to(device) 

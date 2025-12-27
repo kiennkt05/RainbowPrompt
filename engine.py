@@ -193,9 +193,37 @@ def train_and_evaluate(model: torch.nn.Module, model_without_ddp: torch.nn.Modul
     feature_prefix_et = None
         
     for task_id in range(args.num_tasks):
-        # Create new optimizer for each task to clear optimizer status
-        if task_id > 0 and args.reinit_optimizer:
-            optimizer = create_optimizer(args, model) 
+        # LGSP Params separation and Optimizer creation
+        if args.lgsp == 'YES':
+            lgsp_params_set = set() # Store ids to exclude from general params
+            lgsp_groups = []
+            
+            if args.lgsp_type in ['LGSP', 'LSP']:
+                prompt_branch_params = [p for n, p in model.named_parameters() if 'prompt_generators' in n and p.requires_grad]
+                if prompt_branch_params:
+                    lgsp_groups.append({'params': prompt_branch_params, 'lr': getattr(args, 'lr_local', 2e-4)})
+                    for p in prompt_branch_params: lgsp_params_set.add(id(p))
+                    
+            if args.lgsp_type in ['LGSP', 'GSP']:
+                freq_params = [p for n, p in model.named_parameters() if n == 'weights' and p.requires_grad]
+                if freq_params:
+                    lgsp_groups.append({'params': freq_params, 'lr': getattr(args, 'lr_Frequency_mask', 0.03)})
+                    for p in freq_params: lgsp_params_set.add(id(p))
+            
+            if args.lgsp_type == 'LGSP':
+                adapt_params = [p for n, p in model.named_parameters() if n in ('alpha', 'beta') and p.requires_grad]
+                if adapt_params:
+                    lgsp_groups.append({'params': adapt_params, 'lr': args.lr}) 
+                    for p in adapt_params: lgsp_params_set.add(id(p))
+
+            remaining_params = [p for n, p in model.named_parameters() if id(p) not in lgsp_params_set and p.requires_grad]
+            
+            network_params = [{'params': remaining_params}] # Uses default lr/wd from args inside create_optimizer
+            network_params.extend(lgsp_groups)
+        
+        # Create new optimizer for each task (or task 0) to ensure LGSP params are handled
+        if task_id == 0 or (task_id > 0 and args.reinit_optimizer):
+            optimizer = create_optimizer(args, network_params) 
         
         for epoch in range(args.epochs):           
             train_stats = train_one_epoch(model=model, original_model=original_model, criterion=criterion,

@@ -102,6 +102,23 @@ def get_args_parser(subparsers):
     subparsers.add_argument('--train_mask', default=True, type=bool, help='if using the class mask at training')
     subparsers.add_argument('--task_inc', default=False, type=bool, help='if doing task incremental')
 
+    # LGSP parameters
+    subparsers.add_argument('--lgsp', default='NO', type=str, choices=['YES', 'NO'], help='Whether using LGSP or not')
+    subparsers.add_argument('--lgsp_type', default='LGSP', type=str, choices=['LGSP', 'LSP', 'GSP'], help='LGSP type')
+
+    # LSP parameters
+    subparsers.add_argument('--lsp_pool_size', default=24, type=int, help='LSP pool size')
+    subparsers.add_argument('--prompt_hid_dim', default=3, type=int, help='Prompt hidden dim')
+    subparsers.add_argument('--first_kernel_size', default=3, type=int)
+    subparsers.add_argument('--second_kernel_size', default=5, type=int)
+    subparsers.add_argument('--Dropout_Prompt', default=0.1, type=float)
+    subparsers.add_argument('--lr_local', default=2e-4, type=float)
+
+    # GSP parameters
+    subparsers.add_argument('--num_r', default=100, type=int)
+    subparsers.add_argument('--temperature', default=0.1, type=float)
+    subparsers.add_argument('--lr_Frequency_mask', default=0.03, type=float)
+
     # G-Prompt parameters
     subparsers.add_argument('--use_g_prompt', default=False, type=bool, help='if using G-Prompt')
     subparsers.add_argument('--g_prompt_length', default=0, type=int, help='length of G-Prompt')

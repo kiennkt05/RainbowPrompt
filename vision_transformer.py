@@ -321,7 +321,7 @@ class VisionTransformer(nn.Module):
             top_k=None, batchwise_prompt=False, prompt_key_init='uniform', head_type='token', use_prompt_mask=False,
             use_g_prompt=False, g_prompt_length=None, g_prompt_layer_idx=None, use_prefix_tune_for_g_prompt=False,
             use_e_prompt=False, e_prompt_layer_idx=None, use_prefix_tune_for_e_prompt=False, same_key_value=False, n_tasks=None, 
-            D1=None, relation_type=None, use_linear=None, warm_up=None, KI_iter=None, self_attn_idx=None, D2=None):
+            D1=None, relation_type=None, use_linear=None, warm_up=None, KI_iter=None, self_attn_idx=None, D2=None, args=None):
         """
         Args:
             img_size (int, tuple): input image size
@@ -362,6 +362,7 @@ class VisionTransformer(nn.Module):
         self.num_prefix_tokens = 1 if class_token else 0
         self.no_embed_class = no_embed_class
         self.grad_checkpointing = False
+        self.args = args
 
         self.patch_embed = embed_layer(
             img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
@@ -431,6 +432,52 @@ class VisionTransformer(nn.Module):
                     num_heads=num_heads, same_key_value=same_key_value, prompt_tune_idx=e_prompt_layer_idx, n_tasks=n_tasks, 
                     D1=D1, relation_type=relation_type, use_linear=use_linear, KI_iter=KI_iter, self_attn_idx=self_attn_idx,
                     D2=D2)
+        
+        # Pixel prompt initialization
+        self.Dropout_Prompt = args.Dropout_Prompt
+        self.prompt_dropout = torch.nn.Dropout(self.Dropout_Prompt)
+        self.first_kernel_size = args.first_kernel_size
+        self.second_kernel_size = args.second_kernel_size
+        
+        def build_prompt_module():
+            prompt_hid_dim = args.prompt_hid_dim
+            return nn.Sequential(
+                nn.Conv2d(3, prompt_hid_dim, self.first_kernel_size, stride=1, padding=int((self.first_kernel_size - 1) / 2)),
+                nn.ReLU(),
+                nn.Conv2d(prompt_hid_dim, 3, self.second_kernel_size, stride=1, padding=int((self.second_kernel_size - 1) / 2))
+            )
+
+        self.prompt_generators = nn.ModuleList()
+        pixel_prompt = args.lgsp == 'YES' and args.lgsp_type in ['LGSP', 'LSP']
+        actual_pool_size = args.lsp_pool_size
+
+        if pixel_prompt:
+            self.prompt_generators = nn.ModuleList(
+                build_prompt_module() for _ in range(actual_pool_size)
+            )
+            self.num_prompt_generators = actual_pool_size
+        else:
+            self.num_prompt_generators = 0
+
+        # Frequency mask initialization
+        Frequency_mask = args.lgsp == 'YES' and args.lgsp_type in ['LGSP', 'GSP']
+        if Frequency_mask:
+            # Handle img_size as either int or tuple
+            if isinstance(img_size, (tuple, list)):
+                img_size_val = img_size[0] if len(img_size) > 0 else 224
+            else:
+                img_size_val = img_size
+            max_radius = torch.sqrt(torch.tensor((img_size_val / 2) ** 2 + (img_size_val / 2) ** 2)).item()
+            num_r = args.num_r
+            # Register as buffer so it moves to correct device automatically
+            self.register_buffer('radii', torch.linspace(0, max_radius, steps=num_r))
+            weights_init = torch.normal(mean=0, std=10, size=(num_r,))
+            self.weights = nn.Parameter(weights_init)
+
+        adaptive_weighting = args.lgsp == 'YES' and args.lgsp_type == 'LGSP'
+        if adaptive_weighting:
+            self.alpha = nn.Parameter(torch.tensor(0.5, requires_grad=True))
+            self.beta = nn.Parameter(torch.tensor(0.5, requires_grad=True))
         
         if not (use_g_prompt or use_e_prompt):
             attn_layer = Attention
@@ -502,6 +549,93 @@ class VisionTransformer(nn.Module):
             self.global_pool = global_pool
         self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
+    # Define a function to calculate cosine similarity, focusing more on local similarity.
+    def cosine_similarity(self, a, b):
+        # Normalize the vectors
+        a_norm = F.normalize(a, dim=1)  # [batch_size, channels, h, w]
+        b_norm = F.normalize(b, dim=1)  # [batch_size, channels, h, w]
+        # Calculate the dot product
+        return torch.sum(a_norm * b_norm, dim=1, keepdim=True)  # [batch_size, 1, h, w]
+    
+    def get_prompts(self, x):
+        res = {}  # Initialize res as an empty dictionary
+        prompts_list = []
+        for prompt_net in self.prompt_generators:
+            prompts_list.append(self.prompt_dropout(prompt_net(x)))
+
+        self.num_prompt_generators = len(prompts_list)
+
+        # Early return if no prompt generators are available
+        if len(prompts_list) == 0:
+            res['prompts'] = torch.zeros_like(x)
+            return res
+
+        # Use point-wise convolution to increase the channel dimension
+        # Feature normalization, such as BatchNorm or GroupNorm, to reduce redundant information
+        # Perform softmax on the branches
+        similarities_list = [self.cosine_similarity(x, prompt) for prompt in prompts_list]  # Each element is [batch_size, 1, h, w]
+
+        # Concatenate all similarities and perform softmax normalization
+        similarities = torch.cat(similarities_list, dim=1)  # [batch_size, 20, h, w]
+        weights = F.softmax(similarities, dim=1)  # [batch_size, 20, h, w]
+        
+        # Stack prompts and perform weighted sum
+        prompts = torch.stack(prompts_list, dim=1)  # [batch_size, 10, channels, h, w]
+        weighted_prompt = torch.sum(weights.unsqueeze(2) * prompts, dim=1)  # [batch_size, channels, h, w]
+        prompts = weighted_prompt
+
+        res['prompts'] = prompts
+        return res
+    
+    def get_Frequency_mask(self, input):
+        # Perform Fourier transform on the h and w dimensions
+        fft_im = torch.fft.fftn(input, dim=(-2, -1))  # 2D Fourier transform
+        fft_im_center = torch.fft.fftshift(fft_im, dim=(-2, -1))  # Shift the zero frequency to the center
+
+        # Build a grid to calculate the distance from each point to the center of the spectrum
+        Batch_size, channels, h, w = input.shape
+        y, x = torch.meshgrid(torch.arange(h), torch.arange(w), indexing='ij')
+        center_y, center_x = h // 2, w // 2  # Center of the spectrum
+        distances = torch.sqrt((y - center_y) ** 2 + (x - center_x) ** 2)  # Distance matrix
+        distances = distances.to(input.device)  # Ensure the device is consistent
+
+        # Create a ring mask, allow a certain tolerance range
+        beta = 4.0
+        ring_masks = []  # Store the mask of each ring
+        # Ensure radii tensor is on the same device as distances
+        radii = self.radii.to(input.device)
+        for i, radius in enumerate(radii):
+            if i == 0:
+                inner_radius = torch.tensor(0.0, device=input.device)  # The first ring starts from the center
+            else:
+                inner_radius = radii[i - 1] + 1e-6  # Ensure no overlap
+
+            # Outer radius mask
+            outer_mask = torch.sigmoid(-beta * (distances - radius))
+            # Inner radius mask
+            inner_mask = torch.sigmoid(-beta * (distances - inner_radius))
+            # Ring mask
+            ring_mask = outer_mask - inner_mask
+            ring_masks.append(ring_mask.float())  # Convert to float, for subsequent operations
+
+        # Stack the masks into a tensor of shape [10, h, w]
+        ring_masks = torch.stack(ring_masks, dim=0).to(input.device)  # [10, h, w]
+
+        # Weight each ring
+        temperature = getattr(self.args, 'temperature', 0.1)
+        weights_normalized = torch.softmax(self.weights * temperature, dim=0)  # Normalize the weights
+        weighted_ring_masks = weights_normalized[:, None, None] * ring_masks  # Weighted mask
+        # Sum the weighted masks, get the overall frequency mask
+        final_mask = weighted_ring_masks.sum(dim=0)  # [h, w]
+
+        # Apply the frequency mask
+        fft_selected = fft_im_center * final_mask[None, None, :, :]  # Broadcast to [Batch_size, 3, h, w]
+        
+        # Inverse Fourier transform to get back to the image domain
+        ifft_im = torch.fft.ifftshift(fft_selected, dim=(-2, -1))
+        ifft_im = torch.fft.ifftn(ifft_im, dim=(-2, -1))
+        return ifft_im.real
+
     def forward_features(self, x, task_id=-1, learned_id=-1, cls_features=None, train=False, epoch_info=None):
 
         if train:
@@ -511,6 +645,20 @@ class VisionTransformer(nn.Module):
                 prompt_type = 'Unique'
         else:
             prompt_type = 'Rainbow'
+        
+        if args.lgsp == 'YES':if args.lgsp_type == 'LGSP':
+                res = self.get_prompts(x)  
+                prompts = res['prompts']
+                input1 = x + prompts * 1
+                input2 = self.get_Frequency_mask(x)
+                x = self.alpha * input1 + self.beta * input2
+            elif args.lgsp_type == 'LSP':
+                res = self.get_prompts(x)  
+                prompts = res['prompts']
+                x = x + prompts * 1
+            elif args.lgsp_type == 'GSP':
+                x = self.get_Frequency_mask(x)  
+
         x = self.patch_embed(x)
 
         if self.cls_token is not None:
